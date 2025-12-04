@@ -1,0 +1,15 @@
+# CMake
+/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Backup / misc
+*.swp
+*.swo
+*.tmp
+*.log
+
+# IDEs
+.cache/
