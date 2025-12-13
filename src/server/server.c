@@ -1,11 +1,13 @@
 #include "protocol.h"
 
-#include <arpa/inet.h>
+#include <bits/pthreadtypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -20,6 +22,10 @@ typedef enum {
     SET_BAD_REQUEST = 2
 } set_result_t;
 
+typedef struct {
+    int client_fd;
+} client_ctx_t;
+
 static device_status_t g_devices[] = {
     { .device_id = 1, .temperature = 22.5, .battery = 85, .status = 1 },
     { .device_id = 2, .temperature = 19.0, .battery = 60, .status = 1 },
@@ -29,6 +35,9 @@ static device_status_t g_devices[] = {
 };
 static const size_t g_device_count = sizeof(g_devices) / sizeof(g_devices[0]);
 
+static pthread_mutex_t g_devices_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
 static device_status_t* find_device(uint32_t device_id);
 
 
@@ -37,6 +46,11 @@ static int handle_get(int fd, const uint8_t *payload, uint16_t len);
 static int handle_set(int fd, const uint8_t *payload, uint16_t len);
 
 static int dispatch_request(int fd, uint16_t type, const uint8_t *payload, uint16_t len);
+
+static void devices_lock(void);
+static void devices_unlock(void);
+
+static void *client_thread(void *arg);
 
 int server_run(void) {
     int listen_fd, status, opt;
@@ -77,42 +91,32 @@ int server_run(void) {
 
     printf("[server] listening on port %d...\n", SERVER_PORT);
 
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-    if(client_fd < 0) {
-        perror("accept");
-        close(listen_fd);
-        return 1;
-    }
-
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-    printf("[server] client connected from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
-
-
-    uint8_t buffer[1024];
     while(1) {
-        uint16_t type = 0, len = 0;
-
-        int status = recv_tlv(client_fd, &type, buffer, sizeof(buffer), &len);
-        if(status == 1) {
-            printf("[server] client disconnected\n");
-            break;
-        } else if(status < 0) {
-            perror("recv_tlv");
-            break;
-        }        
-
-        printf("[server] received TLV type=0x%04x length=%d\n", type, len);
-
-        if(dispatch_request(client_fd, type, buffer, len)) {
-            printf("[server] handler error\n");
-            break;
+        int client_fd = accept(listen_fd, NULL, NULL);
+        if(client_fd < 0) {
+            perror("accept");
+            continue;
         }
+
+        client_ctx_t *ctx = malloc(sizeof(*ctx));
+        if(!ctx) {
+            close(client_fd);
+            continue;
+        }
+        ctx->client_fd = client_fd;
+
+        pthread_t th;
+
+        if(pthread_create(&th, NULL, client_thread, ctx) != 0) {
+            perror("pthread_create");
+            close(client_fd);
+            free(ctx);
+            continue;
+        }
+
+        pthread_detach(th);
     }
 
-    close(client_fd);
     close(listen_fd);
     return 0;
 }
@@ -142,8 +146,11 @@ static int dispatch_request(int fd, uint16_t type, const uint8_t *payload, uint1
 }
 
 static int handle_list(int fd) {
+    devices_lock();
     uint16_t payload_len = (uint16_t)(g_device_count * sizeof(device_status_t));
     int status = send_tlv(fd, TLV_TYPE_LIST_RESPONSE, g_devices, payload_len);
+    devices_unlock();
+
     if(status < 0) {
         printf("[server] send LIST_RESPONSE failed\n");
         return -1;
@@ -160,13 +167,17 @@ static int handle_get(int fd, const uint8_t *payload, uint16_t len) {
     uint32_t id_net = 0;
     memcpy(&id_net, payload, sizeof(id_net));
     uint32_t device_id = ntohl(id_net);
+    devices_lock();
     device_status_t *dev = find_device(device_id);
     if(dev == NULL) {
         printf("[server] device ID %u not found\n", device_id);
         return send_tlv(fd, TLV_TYPE_GET_RESPONSE, NULL, 0);
     }
 
-    return send_tlv(fd, TLV_TYPE_GET_RESPONSE, dev, sizeof(device_status_t));
+    int rc = send_tlv(fd, TLV_TYPE_GET_RESPONSE, dev, sizeof(device_status_t));
+    devices_unlock();
+
+    return (rc < 0) ? -1 : 0;
 
 }
 
@@ -185,6 +196,7 @@ static int handle_set(int fd, const uint8_t *payload, uint16_t len) {
     float temperature;
     memcpy(&temperature, &temp_bits_net, sizeof(temperature));
 
+    devices_lock();
     device_status_t *dev = find_device(device_id);
     uint8_t code = SET_OK;
     if(dev == NULL) {
@@ -194,6 +206,38 @@ static int handle_set(int fd, const uint8_t *payload, uint16_t len) {
         dev->temperature = temperature;
         printf("[server] updated device ID %u temperature to %.2f\n", device_id, temperature);
     }
+    devices_unlock();
 
     return send_tlv(fd, TLV_TYPE_SET_RESPONSE, &code, sizeof(code));
+}
+
+static void devices_lock(void) {
+    pthread_mutex_lock(&g_devices_mutex);
+}
+static void devices_unlock(void) {
+    pthread_mutex_unlock(&g_devices_mutex);
+}
+
+static void *client_thread(void *arg) {
+    client_ctx_t *ctx = (client_ctx_t*)arg;
+    int fd = ctx->client_fd;
+    free(ctx);
+
+    uint8_t buffer[1024];
+
+    while(1) {
+        uint16_t type = 0, len = 0;
+        int rc = recv_tlv(fd, &type, buffer, sizeof(buffer), &len);
+
+        if(rc == 1) break;
+        if (rc < 0) break;
+
+        if(dispatch_request(fd, type, buffer, len) < 0) {
+            break;
+        }
+
+    }
+
+    close(fd);
+    return NULL;
 }
