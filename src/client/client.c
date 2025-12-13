@@ -12,161 +12,44 @@
 #include <arpa/inet.h>
 
 #define SERVER_PORT "5001"
+#define RX_BUFF_SIZE 1024
+#define LINE_BUFF_SIZE 256
 
-static void print_device(const device_status_t *dev)
-{
-    printf("  id=%u  temp=%.2f C  batt=%u%%  status=%u\n",
-           dev->device_id,
-           dev->temperature,
-           dev->battery,
-           dev->status);
-}
 
-static int handle_list(int fd)
-{
-    if (send_tlv(fd, TLV_TYPE_LIST_REQUEST, NULL, 0) < 0) {
-        printf("[client] send_tlv LIST_REQUEST failed\n");
-        return -1;
-    }
+typedef enum {
+    CMD_NONE = 0,
+    CMD_HELP,
+    CMD_LIST,
+    CMD_GET,
+    CMD_SET,
+    CMD_EXIT
+} command_type_t;
 
-    uint8_t buffer[1024];
-    uint16_t type = 0;
-    uint16_t length = 0;
 
-    int rc = recv_tlv(fd, &type, buffer, sizeof(buffer), &length);
-    if (rc == 1) {
-        printf("[client] server closed connection (EOF)\n");
-        return 1;
-    } else if (rc < 0) {
-        printf("[client] recv_tlv failed\n");
-        return -1;
-    }
+typedef struct {
+    command_type_t type;
+    uint32_t id;
+    float temp;
+} command_t;
 
-    if (type != TLV_TYPE_LIST_RESPONSE) {
-        printf("[client] unexpected response type=0x%04x\n", type);
-        return -1;
-    }
 
-    if (length % sizeof(device_status_t) != 0) {
-        printf("[client] invalid LIST_RESPONSE length=%u\n", length);
-        return -1;
-    }
+static void trim_newline(char *str);
+static char *skip_spaces(char *str);
+static char *next_token(char **strp);
 
-    size_t count = length / sizeof(device_status_t);
-    printf("[client] received %zu devices:\n", count);
 
-    device_status_t *devs = (device_status_t *)buffer;
-    for (size_t i = 0; i < count; ++i) {
-        print_device(&devs[i]);
-    }
+static void print_device(const device_status_t *dev);
+static void print_help(void);
 
-    return 0;
-}
+static int parse_command(char *line, command_t *cmd);
 
-static int handle_get(int fd, uint32_t id)
-{
-    uint32_t id_net = htonl(id);
-    if (send_tlv(fd, TLV_TYPE_GET_REQUEST, &id_net, sizeof(id_net)) < 0) {
-        printf("[client] send_tlv GET_REQUEST failed\n");
-        return -1;
-    }
+static int cmd_list(int fd);
+static int cmd_get(int fd, uint32_t id);
+static int cmd_set(int fd, uint32_t id, float temp);
 
-    uint8_t buffer[1024];
-    uint16_t type = 0;
-    uint16_t length = 0;
+static int recv_expect(int fd, uint16_t expected_type, void *buf, uint16_t bufsize, uint16_t *out_len);
 
-    int rc = recv_tlv(fd, &type, buffer, sizeof(buffer), &length);
-    if (rc == 1) {
-        printf("[client] server closed connection (EOF)\n");
-        return 1;
-    } else if (rc < 0) {
-        printf("[client] recv_tlv failed\n");
-        return -1;
-    }
-
-    if (type != TLV_TYPE_GET_RESPONSE) {
-        printf("[client] unexpected response type=0x%04x\n", type);
-        return -1;
-    }
-
-    if (length == 0) {
-        printf("[client] device %u not found\n", id);
-        return 0;
-    }
-
-    if (length != sizeof(device_status_t)) {
-        printf("[client] invalid GET_RESPONSE length=%u\n", length);
-        return -1;
-    }
-
-    device_status_t dev;
-    memcpy(&dev, buffer, sizeof(dev));
-
-    printf("[client] device details:\n");
-    print_device(&dev);
-    return 0;
-}
-
-static int handle_set(int fd, uint32_t id, float temp) {
-    uint32_t payload[2];
-    int status;
-    payload[0] = htonl(id);
-    memcpy(&payload[1], &temp, sizeof(float));
-
-    status = send_tlv(fd, TLV_TYPE_SET_REQUEST, payload, sizeof(payload));
-    if (status < 0) {
-        printf("[client] send_tlv SET_REQUEST failed\n");
-        return -1;
-    }
-
-    uint8_t buffer[1024];
-    uint16_t type = 0;
-    uint16_t length = 0;
-    status = recv_tlv(fd, &type, buffer, sizeof(buffer), &length);
-    if (status == 1) {
-        printf("[client] server closed connection (EOF)\n");
-        return 1;
-    } else if (status < 0) {
-        printf("[client] recv_tlv failed\n");
-        return -1;
-    }
-
-    if (type != TLV_TYPE_SET_RESPONSE) {
-        printf("[client] unexpected response type=0x%04x\n", type);
-        return -1;
-    }
-
-    if (length != 1) {
-        printf("[client] invalid SET_RESPONSE length=%u\n", length);
-        return -1;
-    }
-
-    uint8_t code = buffer[0];
-    if (code == 0) {
-        printf("[client] SET successful for device %u\n", id);
-    } else if(code == 1) {
-        printf("[client] SET failed: device %u not found\n", id);
-    } else if(code == 2) {
-        printf("[client] SET failed: bad request\n");
-    } else {
-        printf("[client] SET failed: unknown error code %u\n", code);
-    }
-
-    return 0;    
-}
-
-static void print_help(void)
-{
-    printf("Available commands:\n");
-    printf("  list             - show all devices\n");
-    printf("  get <id>         - show details of selected device\n");
-    printf("  set <id> <temp>  - set temperature of selected device\n");
-    printf("  help             - show this help\n");
-    printf("  exit / quit      - close connection and exit\n");
-}
-
-int client_run(void)
-{
+int client_run(void) {
     struct addrinfo hints;
     struct addrinfo *res = NULL;
 
@@ -198,95 +81,273 @@ int client_run(void)
     printf("[client] connected to server\n");
     print_help();
 
-    char line[256];
+    char line[LINE_BUFF_SIZE];
 
-    for (;;) {
+    while(1) {
         printf("> ");
         fflush(stdout);
 
-        if (!fgets(line, sizeof(line), stdin)) {
+        if(!fgets(line, sizeof(line), stdin)) {
             printf("\n[client] EOF on stdin, exiting\n");
             break;
         }
+        trim_newline(line);
 
-        line[strcspn(line, "\r\n")] = '\0';
+        command_t cmd;
+        int prc = parse_command(line, &cmd);
 
-        if (line[0] == '\0') {
+        if(prc == 0 && cmd.type == CMD_NONE) {
+            continue;
+        } else if(prc == -1) {
+            printf("usage:\n");
+            print_help();
+            continue;
+        } else if(prc == -2) {
+            printf("unknown command: '%s'\n", line);
+            print_help();
             continue;
         }
 
-        if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) {
-            printf("[client] exiting on user request\n");
+        int rc = 0;
+
+        switch(cmd.type) {
+            case CMD_HELP:
+                print_help();
+                break;
+            case CMD_LIST:
+                rc = cmd_list(fd);
+                break;
+            case CMD_GET:
+                rc = cmd_get(fd, cmd.id);
+                break;
+            case CMD_SET:
+                rc = cmd_set(fd, cmd.id, cmd.temp);
+                break;
+            case CMD_EXIT:
+                printf("[client] exiting on user request\n");
+                close(fd);
+                return 0;
+                break;
+            default:
+                break;
+        }
+
+        if(rc == 1) {
             break;
-        } else if (strcmp(line, "help") == 0) {
-            print_help();
-        } else if (strcmp(line, "list") == 0) {
-            int rc = handle_list(fd);
-            if (rc != 0) {
-                printf("[client] list failed, rc=%d\n", rc);
-                break;
-            }
-        } else if (strncmp(line, "get ", 4) == 0) {
-            char *arg = line + 4;
-            while (*arg == ' ') arg++;
-            if (*arg == '\0') {
-                printf("usage: get <id>\n");
-                continue;
-            }
-
-            char *endptr = NULL;
-            unsigned long id_ul = strtoul(arg, &endptr, 10);
-            if (*endptr != '\0') {
-                printf("invalid id: %s\n", arg);
-                continue;
-            }
-
-            uint32_t id = (uint32_t)id_ul;
-            int rc = handle_get(fd, id);
-            if (rc != 0) {
-                printf("[client] get failed, rc=%d\n", rc);
-                break;
-            }
-        } else if(strncmp(line, "set ", 4) == 0) {
-            char *arg = line + 4;
-            while (*arg == ' ') arg++;
-            if (*arg == '\0') {
-                printf("usage: set <id> <temp>\n");
-                continue;
-            }
-
-            char *endptr = NULL;
-            unsigned long id_ul = strtoul(arg, &endptr, 10);
-            if (*endptr != ' ') {
-                printf("invalid id: %s\n", arg);
-                continue;
-            }
-
-            arg = endptr;
-            while (*arg == ' ') arg++;
-            if (*arg == '\0') {
-                printf("usage: set <id> <temp>\n");
-                continue;
-            }
-
-            float temp = strtof(arg, &endptr);
-            if (*endptr != '\0') {
-                printf("invalid temperature: %s\n", arg);
-                continue;
-            }
-
-            uint32_t id = (uint32_t)id_ul;
-            int rc = handle_set(fd, id, temp);
-            if (rc != 0) {
-                printf("[client] set failed, rc=%d\n", rc);
-                break;
-            }
-        } else {
-            printf("unknown command: '%s'\n", line);
-            print_help();
+        } else if(rc < 0) {
+            printf("[client] command failed\n");
+            break;
         }
     }
-
     close(fd);
+    return 0;
+}
+
+
+static void trim_newline(char *str) {
+    str[strcspn(str, "\r\n")] = '\0';
+}
+
+static char *skip_spaces(char *str) {
+    while (*str == ' ') str++;
+
+    return str;
+}
+
+static char *next_token(char **strp) {
+    char *s = skip_spaces(*strp);
+    if (*s == '\0') {
+        *strp = s;
+        return NULL;
+    }
+
+    char *start = s;
+    while(*s != '\0' && *s != ' ' && *s != '\t') s++;
+
+    if (*s != '\0') {
+        *s = '\0';
+        s++;
+    }
+    *strp = s;
+    return start;
+}
+
+static void print_device(const device_status_t *dev) {
+    printf("  id=%u  temp=%.2f C  batt=%u%%  status=%u\n",
+           dev->device_id,
+           dev->temperature,
+           dev->battery,
+           dev->status);
+}
+
+static void print_help(void) {
+    printf("Available commands:\n");
+    printf("  list             - show all devices\n");
+    printf("  get <id>         - show details of selected device\n");
+    printf("  set <id> <temp>  - set temperature of selected device\n");
+    printf("  help             - show this help\n");
+    printf("  exit / quit      - close connection and exit\n");
+}
+
+static int parse_command(char *line, command_t *cmd) {
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->type = CMD_NONE;
+
+    char *p = line;
+    char *token = next_token(&p);
+    if(!token) return 0;
+
+    if(strcmp(token, "help") == 0) {
+        cmd->type = CMD_HELP;
+        return 0;
+    }
+    if(strcmp(token, "list") == 0) {
+        cmd->type = CMD_LIST;
+        return 0;
+    }
+    if(strcmp(token, "exit") == 0 || strcmp(token, "quit") == 0) {
+        cmd->type = CMD_EXIT;
+        return 0;
+    }
+    if(strcmp(token, "get") == 0) {
+        char *id_str = next_token(&p);
+        if(!id_str) {
+            return -1;
+        }
+        uint32_t id = (uint32_t)strtoul(id_str, NULL, 10);
+        cmd->type = CMD_GET;
+        cmd->id = id;
+        return 0;
+    }
+    if(strcmp(token, "set") == 0) {
+        char *id_str = next_token(&p);
+        char *temp_str = next_token(&p);
+        if(!id_str || !temp_str) {
+            return -1;
+        }
+
+        uint32_t id = (uint32_t)strtoul(id_str, NULL, 10);
+        float temp = strtof(temp_str, NULL);
+        cmd->type = CMD_SET;
+        cmd->id = id;
+        cmd->temp = temp;
+        return 0;
+    }
+
+    return -2; // unknown command
+}
+
+static int cmd_list(int fd) {
+    int status = send_tlv(fd, TLV_TYPE_LIST_REQUEST, NULL, 0);
+    if (status < 0) {
+        printf("[client] send_tlv LIST_REQUEST failed\n");
+        return -1;
+    }
+
+    uint8_t rx[RX_BUFF_SIZE];
+    uint16_t len = 0;
+
+    status = recv_expect(fd, TLV_TYPE_LIST_RESPONSE, rx, sizeof(rx), &len);
+    if (status != 0) return status;
+
+    if(len % sizeof(device_status_t) != 0) {
+        printf("[client] invalid LIST_RESPONSE length=%u\n", len);
+        return -1;
+    }
+
+    size_t count = len / sizeof(device_status_t);
+    printf("[client] received %zu devices:\n", count);
+
+    device_status_t *devs = (device_status_t *)rx;
+    for(size_t i = 0; i < count; ++i) {
+        print_device(&devs[i]);
+    }
+    return 0;
+}
+
+static int cmd_get(int fd, uint32_t id) {
+    uint32_t id_net = htonl(id);
+    int status = send_tlv(fd, TLV_TYPE_GET_REQUEST, &id_net, sizeof(id_net));
+    if(status < 0) {
+        printf("[client] send_tlv GET_REQUEST failed\n");
+        return -1;
+    }
+
+    uint8_t rx[RX_BUFF_SIZE];
+    uint16_t len = 0;
+
+    status = recv_expect(fd, TLV_TYPE_GET_RESPONSE, rx, sizeof(rx), &len);
+    if (status != 0) return status;
+
+    if(len == 0) {
+        printf("[client] device %u not found\n", id);
+        return 0;
+    }
+
+    if(len != sizeof(device_status_t)) {
+        printf("[client] invalid GET_RESPONSE length=%u\n", len);
+        return -1;
+    }
+
+    device_status_t dev;
+    memcpy(&dev, rx, sizeof(dev));
+    printf("[client] device details:\n");
+    print_device(&dev);
+    return 0;
+}
+
+static int cmd_set(int fd, uint32_t id, float temp) {
+    uint32_t payload[2];
+    payload[0] = htonl(id);
+    memcpy(&payload[1], &temp, sizeof(float));
+
+    int status = send_tlv(fd, TLV_TYPE_SET_REQUEST, payload, sizeof(payload));
+    if(status < 0) {
+        printf("[client] send_tlv SET_REQUEST failed\n");
+        return -1;
+    }
+
+    uint8_t rx[RX_BUFF_SIZE];
+    uint16_t len = 0;
+
+    status = recv_expect(fd, TLV_TYPE_SET_RESPONSE, rx, sizeof(rx), &len);
+    if (status != 0) return status;
+
+    if(len != 1) {
+        printf("[client] invalid SET_RESPONSE length=%u\n", len);
+        return -1;
+    }
+
+    uint8_t code = rx[0];
+    if(code == 0) {
+        printf("[client] SET successful for device %u\n", id);
+    } else if(code == 1) {
+        printf("[client] SET failed: device %u not found\n", id);
+    } else if(code == 2) {
+        printf("[client] SET failed: bad request\n");
+    } else {
+        printf("[client] SET failed: unknown error code %u\n", code);
+    }
+
+    return 0;
+
+}
+
+static int recv_expect(int fd, uint16_t expected_type, void *buf, uint16_t bufsize, uint16_t *out_len) {
+    uint16_t type = 0, len = 0;
+    int rc = recv_tlv(fd, &type, buf, bufsize, &len);
+    if (rc == 1) {
+        printf("[client] server closed connection (EOF)\n");
+        return 1;
+    } else if (rc < 0) {
+        printf("[client] recv_tlv failed\n");
+        return -1;
+    }
+    if (type != expected_type) {
+        printf("[client] unexpected response type=0x%04x\n", type);
+        return -1;
+    }
+    
+    if (out_len) *out_len = len;
     return 0;
 }
