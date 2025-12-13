@@ -1,6 +1,7 @@
 #include "protocol.h"
 
 #include <bits/pthreadtypes.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+
+#define DISCOVERY_MCAST_ADDR "239.0.0.1"
+#define DISCOVERY_PORT 5000
 #define SERVER_PORT 5001
 
 
@@ -51,6 +55,7 @@ static void devices_lock(void);
 static void devices_unlock(void);
 
 static void *client_thread(void *arg);
+static void *discovery_thread(void *arg);
 
 int server_run(void) {
     int listen_fd, status, opt;
@@ -90,6 +95,13 @@ int server_run(void) {
     }
 
     printf("[server] listening on port %d...\n", SERVER_PORT);
+
+
+    pthread_t disc_thread;
+    pthread_create(&disc_thread, NULL, discovery_thread, NULL);
+    pthread_detach(disc_thread);
+
+
 
     while(1) {
         int client_fd = accept(listen_fd, NULL, NULL);
@@ -240,4 +252,90 @@ static void *client_thread(void *arg) {
 
     close(fd);
     return NULL;
+}
+
+static void *discovery_thread(void *arg) {
+    (void)arg;
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if(fd < 0) {
+        perror("discovery socket");
+        return NULL;
+    }
+
+    int reuse = 1;
+    int status = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if(status < 0) {
+        perror("discovery setsockopt SO_REUSEADDR");
+        close(fd);
+        return NULL;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(DISCOVERY_PORT);
+
+    status = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if(status < 0) {
+        perror("discovery bind");
+        close(fd);
+        return NULL;
+    }
+
+    struct ip_mreq mreq;
+    mreq.imr_multiaddr.s_addr = inet_addr(DISCOVERY_MCAST_ADDR);
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+
+    status = setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+    if(status < 0) {
+        perror("discovery setsockopt IP_ADD_MEMBERSHIP");
+        close(fd);
+        return NULL;
+    }
+    printf("[server] discovery thread listening on %s:%d...\n", DISCOVERY_MCAST_ADDR, DISCOVERY_PORT);
+
+    uint8_t buffer[1024];
+
+    while(1) {
+        struct sockaddr_in src_addr;
+        socklen_t src_addr_len = sizeof(src_addr);
+
+        ssize_t n = recvfrom(fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&src_addr, &src_addr_len);
+        if(n < 0) {
+            perror("discovery recvfrom");
+            continue;
+        }
+
+        uint16_t type = 0, len = 0;
+        int rc = tlv_decode_buf(buffer, (size_t)n, &type, NULL, &len);
+        if(rc < 0) {
+            printf("[server] discovery tlv_decode_buf failed\n");
+            continue;
+        }
+
+        if(type != TLV_TYPE_DISCOVER_REQUEST) {
+            printf("[server] discovery received unknown type 0x%04x\n", type);
+            continue;
+        }
+
+        printf("[server] discovery request received from %s\n", inet_ntoa(src_addr.sin_addr));
+
+        uint16_t tcp_port_net = htons((uint16_t)SERVER_PORT);
+        uint8_t tx[1024];
+        size_t tx_len = 0;
+
+        rc = tlv_encode_buf(tx, sizeof(tx), TLV_TYPE_DISCOVER_RESPONSE, &tcp_port_net, sizeof(tcp_port_net), &tx_len);
+        if(rc < 0) {
+            printf("[server] discovery tlv_encode_buf failed\n");
+            continue;
+        }
+
+        n = sendto(fd, tx, tx_len, 0, (struct sockaddr *)&src_addr, src_addr_len);
+        if(n < 0) {
+            perror("discovery sendto");
+            continue;
+        }
+    }
 }

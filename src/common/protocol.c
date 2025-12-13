@@ -98,3 +98,56 @@ int recv_tlv(int fd, uint16_t *type, void *buf, uint16_t bufsize, uint16_t *out_
 
     return 0;
 }
+
+int tlv_encode_buf(uint8_t *out, size_t out_size, uint16_t type, const void *value, uint16_t len, size_t *out_len) {
+    if (out_size < sizeof(tlv_header_t) + len) {
+        return -1;
+    }
+
+    tlv_header_t hdr;
+    hdr.type = htons(type);
+    hdr.length = htons(len);
+
+    memcpy(out, &hdr, sizeof(hdr));
+    if (len > 0 && value != NULL) {
+        memcpy(out + sizeof(hdr), value, len);
+    }
+
+    if(out_len) *out_len = sizeof(hdr) + len;
+    return 0;
+}
+
+int tlv_decode_buf(const uint8_t *in, size_t in_size, uint16_t *out_type, const uint8_t **out_value, uint16_t *out_len) {
+    if (in_size < sizeof(tlv_header_t)) {
+        return -1;
+    }
+
+
+    if (in_size < sizeof(tlv_header_t)) {
+        return -1;
+    }
+
+    tlv_header_t hdr;
+    memcpy(&hdr, in, sizeof(hdr));
+
+    uint16_t type = ntohs(hdr.type);
+    uint16_t len = ntohs(hdr.length);
+
+    if(in_size < sizeof(hdr) + len) {
+        return -1;
+    }
+
+    if(out_type) {
+        *out_type = type;
+    }
+
+    if(out_len) {
+        *out_len = len;
+    }
+
+    if(out_value) {
+        *out_value = in + sizeof(hdr);
+    }
+
+    return 0;
+}

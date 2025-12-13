@@ -1,5 +1,6 @@
 #include "protocol.h"
 
+#include <bits/types/struct_timeval.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +12,9 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
-#define SERVER_PORT "5001"
+
+#define DISCOVERY_MCAST_ADDR "239.0.0.1"
+#define DISCOVERY_PORT 5000
 #define RX_BUFF_SIZE 1024
 #define LINE_BUFF_SIZE 256
 
@@ -49,35 +52,28 @@ static int cmd_set(int fd, uint32_t id, float temp);
 
 static int recv_expect(int fd, uint16_t expected_type, void *buf, uint16_t bufsize, uint16_t *out_len);
 
+static int discover_server(char *out_ip, size_t ip_size, uint16_t *out_port);
+
+static int connect_to_server(const char *ip, const char *port);
+
 int client_run(void) {
-    struct addrinfo hints;
-    struct addrinfo *res = NULL;
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
+    char ip[INET_ADDRSTRLEN];
+    uint16_t port = 0;
 
-    int err = getaddrinfo("127.0.0.1", SERVER_PORT, &hints, &res);
-    if (err != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err));
+    if(discover_server(ip, sizeof(ip), &port) < 0) {
+        printf("[client] server discovery failed\n");
         return 1;
     }
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        perror("socket");
-        freeaddrinfo(res);
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+
+    int fd = connect_to_server(ip, port_str);
+    if(fd < 0) {
         return 1;
     }
 
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-        perror("connect");
-        close(fd);
-        freeaddrinfo(res);
-        return 1;
-    }
-
-    freeaddrinfo(res);
     printf("[client] connected to server\n");
     print_help();
 
@@ -350,4 +346,104 @@ static int recv_expect(int fd, uint16_t expected_type, void *buf, uint16_t bufsi
     
     if (out_len) *out_len = len;
     return 0;
+}
+
+static int discover_server(char *out_ip, size_t ip_size, uint16_t *out_port) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if(fd < 0) {
+        perror("discovery socket");
+        return -1;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+    struct sockaddr_in mcast_addr;
+    memset(&mcast_addr, 0, sizeof(mcast_addr));
+    mcast_addr.sin_family = AF_INET;
+    mcast_addr.sin_port = htons(DISCOVERY_PORT);
+    inet_pton(AF_INET, DISCOVERY_MCAST_ADDR, &mcast_addr.sin_addr);
+
+    uint8_t tx[1024];
+    size_t tx_len = 0;
+    int rc = tlv_encode_buf(tx, sizeof(tx), TLV_TYPE_DISCOVER_REQUEST, NULL, 0, &tx_len);
+    if(rc < 0) {
+        printf("[client] tlv_encode_buf DISCOVER_REQUEST failed\n");
+        close(fd);
+        return -1;
+    }
+
+    ssize_t n = sendto(fd, tx, tx_len, 0, (struct sockaddr *)&mcast_addr, sizeof(mcast_addr));
+    if(n < 0) {
+        perror("discovery sendto");
+        close(fd);
+        return -1;
+    }
+
+    uint8_t rx[1024];
+    struct sockaddr_in src_addr;
+    socklen_t src_addr_len = sizeof(src_addr);
+    n = recvfrom(fd, rx, sizeof(rx), 0, (struct sockaddr *)&src_addr, &src_addr_len);
+    if(n < 0) {
+        perror("discovery recvfrom");
+        close(fd);
+        return -1;
+    }
+
+    uint16_t type = 0, len = 0;
+    const uint8_t *val = NULL;
+    rc = tlv_decode_buf(rx, (size_t)n, &type, &val, &len);
+    if(rc < 0) {
+        printf("[client] discovery tlv_decode_buf failed\n");
+        close(fd);
+        return -1;
+    }
+
+    if(type != TLV_TYPE_DISCOVER_RESPONSE) {
+        printf("[client] unexpected discovery response type=0x%04x\n", type);
+        close(fd);
+        return -1;
+    }
+
+    uint16_t port_net;
+    memcpy(&port_net, val, sizeof(port_net));
+    *out_port = ntohs(port_net);
+
+    inet_ntop(AF_INET, &src_addr.sin_addr, out_ip, ip_size);
+    close(fd);
+    return 0;
+}
+
+static int connect_to_server(const char *ip, const char *port) {
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int err = getaddrinfo(ip, port, &hints, &res);
+    if (err != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err));
+        return -1;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        perror("socket");
+        freeaddrinfo(res);
+        return -1;
+    }
+
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        perror("connect");
+        close(fd);
+        freeaddrinfo(res);
+        return -1;
+    }
+
+    freeaddrinfo(res);
+    return fd;
 }

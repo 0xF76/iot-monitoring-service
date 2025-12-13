@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define TLV_TYPE_DISCOVER_REQUEST   0x01
@@ -28,3 +29,6 @@ typedef struct {
 
 int send_tlv(int fd, uint16_t type, const void *value, uint16_t length);
 int recv_tlv(int fd, uint16_t *type, void *buf, uint16_t bufsize, uint16_t *out_length);
+
+int tlv_encode_buf(uint8_t *out, size_t out_size, uint16_t type, const void *value, uint16_t len, size_t *out_len);
+int tlv_decode_buf(const uint8_t *in, size_t in_size, uint16_t *out_type, const uint8_t **out_value, uint16_t *out_len);
