@@ -349,6 +349,7 @@ static int recv_expect(int fd, uint16_t expected_type, void *buf, uint16_t bufsi
 }
 
 static int discover_server(char *out_ip, size_t ip_size, uint16_t *out_port) {
+    printf("Searching for server...\n");
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if(fd < 0) {
         perror("discovery socket");
@@ -413,6 +414,7 @@ static int discover_server(char *out_ip, size_t ip_size, uint16_t *out_port) {
 
     inet_ntop(AF_INET, &src_addr.sin_addr, out_ip, ip_size);
     close(fd);
+    printf("Found server at %s:%u\n", out_ip, *out_port);
     return 0;
 }
 
