@@ -1,9 +1,10 @@
 #include "protocol.h"
+#include "server.h"
 
-#include <bits/pthreadtypes.h>
+#include <errno.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -13,12 +14,13 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-
+#include <syslog.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #define DISCOVERY_MCAST_ADDR "239.0.0.1"
 #define DISCOVERY_PORT 5000
 #define SERVER_PORT 5001
-
 
 typedef enum {
     SET_OK = 0,
@@ -30,6 +32,11 @@ typedef struct {
     int client_fd;
 } client_ctx_t;
 
+
+int g_use_syslog = 0;
+volatile sig_atomic_t g_running = 1;
+
+
 static device_status_t g_devices[] = {
     { .device_id = 1, .temperature = 22.5, .battery = 85, .status = 1 },
     { .device_id = 2, .temperature = 19.0, .battery = 60, .status = 1 },
@@ -38,22 +45,15 @@ static device_status_t g_devices[] = {
     { .device_id = 5, .temperature = 18.7, .battery = 90, .status = 1 },
 };
 static const size_t g_device_count = sizeof(g_devices) / sizeof(g_devices[0]);
-
 static pthread_mutex_t g_devices_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-
 static device_status_t* find_device(uint32_t device_id);
-
-
 static int handle_list(int fd);
 static int handle_get(int fd, const uint8_t *payload, uint16_t len);
 static int handle_set(int fd, const uint8_t *payload, uint16_t len);
-
 static int dispatch_request(int fd, uint16_t type, const uint8_t *payload, uint16_t len);
-
 static void devices_lock(void);
 static void devices_unlock(void);
-
 static void *client_thread(void *arg);
 static void *discovery_thread(void *arg);
 
@@ -62,14 +62,14 @@ int server_run(void) {
 
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if(listen_fd < 0) {
-        perror("socket");
+        LOGE("socket creation failed: %s", strerror(errno));
         return 1;
     }
 
     opt = 1;
     status = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     if(status < 0) {
-        perror("setsockopt");
+        LOGE("setsockopt SO_REUSEADDR failed: %s", strerror(errno));
         close(listen_fd);
         return 1;
     }
@@ -82,19 +82,19 @@ int server_run(void) {
 
     status = bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr));
     if(status < 0) {
-        perror("bind");
+        LOGE("bind failed: %s", strerror(errno));
         close(listen_fd);
         return 1;
     }
 
     status = listen(listen_fd, 5);
     if(status < 0) {
-        perror("listen");
+        LOGE("listen failed: %s", strerror(errno));
         close(listen_fd);
         return 1;
     }
 
-    printf("[server] listening on port %d...\n", SERVER_PORT);
+    LOGI("listening on port %d...", SERVER_PORT);
 
 
     pthread_t disc_thread;
@@ -103,10 +103,10 @@ int server_run(void) {
 
 
 
-    while(1) {
+    while(g_running) {
         int client_fd = accept(listen_fd, NULL, NULL);
         if(client_fd < 0) {
-            perror("accept");
+            LOGE("accept failed: %s", strerror(errno));
             continue;
         }
 
@@ -120,7 +120,7 @@ int server_run(void) {
         pthread_t th;
 
         if(pthread_create(&th, NULL, client_thread, ctx) != 0) {
-            perror("pthread_create");
+            LOGE("pthread_create failed: %s", strerror(errno));
             close(client_fd);
             free(ctx);
             continue;
@@ -152,7 +152,7 @@ static int dispatch_request(int fd, uint16_t type, const uint8_t *payload, uint1
         case TLV_TYPE_SET_REQUEST:
             return handle_set(fd, payload, len);
         default:
-            printf("[server] unknown request type 0x%04x\n", type);
+            LOGI("unknown request type 0x%04x", type);
             return 0; // ignore unknown types
     }
 }
@@ -164,7 +164,7 @@ static int handle_list(int fd) {
     devices_unlock();
 
     if(status < 0) {
-        printf("[server] send LIST_RESPONSE failed\n");
+        LOGE("send LIST_RESPONSE failed");
         return -1;
     }
     return 0;
@@ -172,7 +172,7 @@ static int handle_list(int fd) {
 
 static int handle_get(int fd, const uint8_t *payload, uint16_t len) {
     if(len != sizeof(uint32_t)) {
-        printf("[server] GET bad len=%u\n", len);
+        LOGI("GET bad len=%u", len);
         return send_tlv(fd, TLV_TYPE_GET_RESPONSE, NULL, 0);
     }
 
@@ -182,7 +182,8 @@ static int handle_get(int fd, const uint8_t *payload, uint16_t len) {
     devices_lock();
     device_status_t *dev = find_device(device_id);
     if(dev == NULL) {
-        printf("[server] device ID %u not found\n", device_id);
+        devices_unlock();
+        LOGE("device ID %u not found", device_id);
         return send_tlv(fd, TLV_TYPE_GET_RESPONSE, NULL, 0);
     }
 
@@ -195,7 +196,7 @@ static int handle_get(int fd, const uint8_t *payload, uint16_t len) {
 
 static int handle_set(int fd, const uint8_t *payload, uint16_t len) {
     if(len != sizeof(uint32_t) * 2) {
-        printf("[server] SET bad len=%u\n", len);
+        LOGI("SET bad len=%u", len);
         uint8_t code = SET_BAD_REQUEST;
         return send_tlv(fd, TLV_TYPE_SET_RESPONSE, &code, sizeof(code));
     }
@@ -205,18 +206,19 @@ static int handle_set(int fd, const uint8_t *payload, uint16_t len) {
     memcpy(&temp_bits_net, payload + sizeof(id_net), sizeof(temp_bits_net));
     
     uint32_t device_id = ntohl(id_net);
+    uint32_t temp_bits = ntohl(temp_bits_net);
     float temperature;
-    memcpy(&temperature, &temp_bits_net, sizeof(temperature));
+    memcpy(&temperature, &temp_bits, sizeof(temperature));
 
     devices_lock();
     device_status_t *dev = find_device(device_id);
     uint8_t code = SET_OK;
     if(dev == NULL) {
-        printf("[server] device ID %u not found for SET\n", device_id);
+        LOGI("device ID %u not found for SET", device_id);
         code = SET_NOT_FOUND;
     } else {
         dev->temperature = temperature;
-        printf("[server] updated device ID %u temperature to %.2f\n", device_id, temperature);
+        LOGI("updated device ID %u temperature to %.2f", device_id, temperature);
     }
     devices_unlock();
 
@@ -259,14 +261,14 @@ static void *discovery_thread(void *arg) {
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if(fd < 0) {
-        perror("discovery socket");
+        LOGE("discovery socket creation failed: %s", strerror(errno));
         return NULL;
     }
 
     int reuse = 1;
     int status = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     if(status < 0) {
-        perror("discovery setsockopt SO_REUSEADDR");
+        LOGE("discovery setsockopt SO_REUSEADDR failed: %s", strerror(errno));
         close(fd);
         return NULL;
     }
@@ -279,7 +281,7 @@ static void *discovery_thread(void *arg) {
 
     status = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
     if(status < 0) {
-        perror("discovery bind");
+        LOGE("discovery bind failed: %s", strerror(errno));
         close(fd);
         return NULL;
     }
@@ -290,37 +292,37 @@ static void *discovery_thread(void *arg) {
 
     status = setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
     if(status < 0) {
-        perror("discovery setsockopt IP_ADD_MEMBERSHIP");
+        LOGE("discovery setsockopt IP_ADD_MEMBERSHIP failed: %s", strerror(errno));
         close(fd);
         return NULL;
     }
-    printf("[server] discovery thread listening on %s:%d...\n", DISCOVERY_MCAST_ADDR, DISCOVERY_PORT);
+    LOGI("discovery thread listening on %s:%d...", DISCOVERY_MCAST_ADDR, DISCOVERY_PORT);
 
     uint8_t buffer[1024];
 
-    while(1) {
+    while(g_running) {
         struct sockaddr_in src_addr;
         socklen_t src_addr_len = sizeof(src_addr);
 
         ssize_t n = recvfrom(fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&src_addr, &src_addr_len);
         if(n < 0) {
-            perror("discovery recvfrom");
+            LOGE("discovery recvfrom failed: %s", strerror(errno));
             continue;
         }
 
         uint16_t type = 0, len = 0;
         int rc = tlv_decode_buf(buffer, (size_t)n, &type, NULL, &len);
         if(rc < 0) {
-            printf("[server] discovery tlv_decode_buf failed\n");
+            LOGE("discovery tlv_decode_buf failed: %s", strerror(errno));
             continue;
         }
 
         if(type != TLV_TYPE_DISCOVER_REQUEST) {
-            printf("[server] discovery received unknown type 0x%04x\n", type);
+            LOGI("discovery received unknown type 0x%04x", type);
             continue;
         }
 
-        printf("[server] discovery request received from %s\n", inet_ntoa(src_addr.sin_addr));
+        LOGI("discovery request received from %s", inet_ntoa(src_addr.sin_addr));
 
         uint16_t tcp_port_net = htons((uint16_t)SERVER_PORT);
         uint8_t tx[1024];
@@ -328,14 +330,16 @@ static void *discovery_thread(void *arg) {
 
         rc = tlv_encode_buf(tx, sizeof(tx), TLV_TYPE_DISCOVER_RESPONSE, &tcp_port_net, sizeof(tcp_port_net), &tx_len);
         if(rc < 0) {
-            printf("[server] discovery tlv_encode_buf failed\n");
+            LOGE("discovery tlv_encode_buf failed: %s", strerror(errno));
             continue;
         }
 
         n = sendto(fd, tx, tx_len, 0, (struct sockaddr *)&src_addr, src_addr_len);
         if(n < 0) {
-            perror("discovery sendto");
+            LOGE("discovery sendto failed: %s", strerror(errno));
             continue;
         }
     }
+    close(fd);
+    return NULL;
 }

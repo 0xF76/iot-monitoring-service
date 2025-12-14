@@ -295,7 +295,9 @@ static int cmd_get(int fd, uint32_t id) {
 static int cmd_set(int fd, uint32_t id, float temp) {
     uint32_t payload[2];
     payload[0] = htonl(id);
-    memcpy(&payload[1], &temp, sizeof(float));
+    uint32_t temp_bits;
+    memcpy(&temp_bits, &temp, sizeof(float));
+    payload[1] = htonl(temp_bits);
 
     int status = send_tlv(fd, TLV_TYPE_SET_REQUEST, payload, sizeof(payload));
     if(status < 0) {
